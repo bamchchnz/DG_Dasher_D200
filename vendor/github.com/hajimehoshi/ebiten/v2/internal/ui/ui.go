@@ -1,0 +1,352 @@
+// Copyright 2022 The Ebiten Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ui
+
+import (
+	"errors"
+	"image"
+	"sync/atomic"
+
+	_ "github.com/ebitengine/hideconsole"
+
+	"github.com/hajimehoshi/ebiten/v2/internal/atlas"
+	"github.com/hajimehoshi/ebiten/v2/internal/color"
+	"github.com/hajimehoshi/ebiten/v2/internal/colormode"
+	"github.com/hajimehoshi/ebiten/v2/internal/graphicscommand"
+	"github.com/hajimehoshi/ebiten/v2/internal/mipmap"
+	"github.com/hajimehoshi/ebiten/v2/internal/thread"
+)
+
+// RegularTermination represents a regular termination.
+// Run can return this error, and if this error is received,
+// the game loop should be terminated as soon as possible.
+var RegularTermination = errors.New("regular termination")
+
+type FPSModeType int
+
+const (
+	FPSModeVsyncOn FPSModeType = iota
+	FPSModeVsyncOffMaximum
+	FPSModeVsyncOffMinimum
+)
+
+type CursorMode int
+
+const (
+	CursorModeVisible CursorMode = iota
+	CursorModeHidden
+	CursorModeCaptured
+)
+
+type CursorShape int
+
+const (
+	CursorShapeDefault CursorShape = iota
+	CursorShapeText
+	CursorShapeCrosshair
+	CursorShapePointer
+	CursorShapeEWResize
+	CursorShapeNSResize
+	CursorShapeNESWResize
+	CursorShapeNWSEResize
+	CursorShapeMove
+	CursorShapeNotAllowed
+)
+
+type WindowResizingMode int
+
+const (
+	WindowResizingModeDisabled WindowResizingMode = iota
+	WindowResizingModeOnlyFullscreenEnabled
+	WindowResizingModeEnabled
+)
+
+type UserInterface struct {
+	err atomic.Pointer[error]
+
+	isScreenClearedEveryFrame atomic.Bool
+	graphicsLibrary           atomic.Int32
+	running                   atomic.Bool
+	terminated                atomic.Bool
+	tick                      atomic.Int64
+	inputTime                 atomic.Int64
+
+	// preferredColorMode is the color mode the application prefers.
+	//
+	// preferredColorMode is a property of the application rather than of the window: it is kept
+	// even where no window can reflect it.
+	preferredColorMode atomic.Int32
+
+	// refreshRate is the refresh rate, in Hz, of the display the game is presented on.
+	// It is 0 when the rate is unknown.
+	refreshRate atomic.Int32
+
+	whiteImage *Image
+
+	mainThread thread.Thread
+
+	userInterfaceImpl
+}
+
+func (u *UserInterface) PreferredColorMode() colormode.ColorMode {
+	return colormode.ColorMode(u.preferredColorMode.Load())
+}
+
+func (u *UserInterface) SetPreferredColorMode(mode colormode.ColorMode) {
+	if colormode.ColorMode(u.preferredColorMode.Swap(int32(mode))) == mode {
+		return
+	}
+	u.Window().applyColorMode()
+}
+
+var (
+	theUI *UserInterface
+)
+
+func init() {
+	// newUserInterface() must be called in the main goroutine.
+	u, err := newUserInterface()
+	if err != nil {
+		panic(err)
+	}
+	theUI = u
+}
+
+func Get() *UserInterface {
+	return theUI
+}
+
+// GraphicsMaxImageSize returns the maximum image size the graphics driver supports. The graphics
+// driver must be initialized before this is called.
+func (u *UserInterface) GraphicsMaxImageSize() int {
+	return graphicscommand.MaxImageSize(u.graphicsDriver)
+}
+
+// GraphicsColorSpace returns the graphics driver's color space. The graphics driver must be
+// initialized before this is called.
+func (u *UserInterface) GraphicsColorSpace() color.ColorSpace {
+	return u.graphicsDriver.ColorSpace()
+}
+
+// newUserInterface must be called from the main thread.
+func newUserInterface() (*UserInterface, error) {
+	u := &UserInterface{}
+	u.isScreenClearedEveryFrame.Store(true)
+	u.graphicsLibrary.Store(int32(GraphicsLibraryUnknown))
+
+	u.whiteImage = u.NewImage(3, 3, atlas.ImageTypeRegular)
+	pix := make([]byte, 4*u.whiteImage.width*u.whiteImage.height)
+	for i := range pix {
+		pix[i] = 0xff
+	}
+	// As a white image is used at Fill, use WritePixels instead.
+	u.whiteImage.WritePixels(pix, image.Rect(0, 0, u.whiteImage.width, u.whiteImage.height))
+
+	if err := u.init(); err != nil {
+		return nil, err
+	}
+
+	return u, nil
+}
+
+func (u *UserInterface) readPixels(img *Image, pixels []byte, region image.Rectangle) error {
+	if !u.running.Load() {
+		panic("ui: ReadPixels cannot be called before the game starts")
+	}
+
+	ok, err := img.readPixels(pixels, region)
+	if err != nil {
+		return err
+	}
+
+	// ReadPixels failed since this was called in between two frames.
+	// Try this again at the next frame.
+	if !ok {
+		// If this function is called from the same sequence as a game's Update and Draw,
+		// this causes a dead lock.
+		// This never happens so far, but if handling inputs after EndFrame is implemented,
+		// this might be possible (#1704).
+
+		var err error
+		u.context.runInFrame(func() {
+			ok, imgErr := img.readPixels(pixels, region)
+			if imgErr != nil {
+				err = imgErr
+				return
+			}
+			if !ok {
+				// This never reaches since this function must be called in a frame.
+				panic("ui: ReadPixels unexpectedly failed")
+			}
+		})
+		return err
+	}
+
+	return nil
+}
+
+func (u *UserInterface) dumpScreenshot(mipmap *mipmap.Mipmap, name string, blackbg bool) (string, error) {
+	return mipmap.DumpScreenshot(u.graphicsDriver, name, blackbg)
+}
+
+func (u *UserInterface) dumpImages(dir string) (string, error) {
+	return atlas.DumpImages(u.graphicsDriver, dir)
+}
+
+type RunOptions struct {
+	GraphicsLibrary          GraphicsLibrary
+	InitUnfocused            bool
+	ScreenTransparent        bool
+	SkipTaskbar              bool
+	SingleThread             bool
+	DisableHiDPI             bool
+	ColorSpace               color.ColorSpace
+	ApplePressAndHoldEnabled bool
+	X11ClassName             string
+	X11InstanceName          string
+	InitWindowWidthInDIP     int
+	InitWindowHeightInDIP    int
+	WindowPositionSet        bool
+	VMGuestEndpoint          string
+}
+
+// InitialWindowPosition returns the position to place a window of size (ww, wh) in a monitor of size (mw, mh).
+func InitialWindowPosition(mw, mh, ww, wh int) (x, y int) {
+	// The vertical position is visually centered rather than exactly centered: the space below the window
+	// is about twice the space above it. This follows the "Positioning Windows" section in the old Apple
+	// Human Interface Guidelines.
+	// http://web.archive.org/web/20110531113415/http://developer.apple.com/library/mac/#documentation/UserExperience/Conceptual/AppleHIGuidelines/XHIGWindows/XHIGWindows.html
+	return (mw - ww) / 2, (mh - wh) / 3
+}
+
+func (u *UserInterface) error() error {
+	if err := u.err.Load(); err != nil {
+		return *err
+	}
+	return nil
+}
+
+func (u *UserInterface) setError(err error) {
+	if err == nil {
+		return
+	}
+	for {
+		oldErr := u.err.Load()
+		var newErr error
+		if oldErr != nil {
+			newErr = errors.Join(*oldErr, err)
+		} else {
+			newErr = err
+		}
+		if u.err.CompareAndSwap(oldErr, &newErr) {
+			break
+		}
+	}
+}
+
+func (u *UserInterface) IsScreenClearedEveryFrame() bool {
+	return u.isScreenClearedEveryFrame.Load()
+}
+
+func (u *UserInterface) SetScreenClearedEveryFrame(cleared bool) {
+	u.isScreenClearedEveryFrame.Store(cleared)
+}
+
+func (u *UserInterface) setGraphicsLibrary(library GraphicsLibrary) {
+	u.graphicsLibrary.Store(int32(library))
+}
+
+func (u *UserInterface) GraphicsLibrary() GraphicsLibrary {
+	return GraphicsLibrary(u.graphicsLibrary.Load())
+}
+
+func (u *UserInterface) setRefreshRate(refreshRate int) {
+	u.refreshRate.Store(int32(refreshRate))
+}
+
+// RefreshRate returns the refresh rate, in Hz, of the display the game is presented on.
+// It returns 0 when the rate is unknown.
+func (u *UserInterface) RefreshRate() int {
+	return int(u.refreshRate.Load())
+}
+
+// IsRunning reports whether the game is running, which is when the graphics driver exists.
+func (u *UserInterface) IsRunning() bool {
+	return u.isRunning()
+}
+
+func (u *UserInterface) isRunning() bool {
+	// TODO: Replace the running state with the existence of a published backend
+	// for all the platforms, like the desktop build (see setRunningBackend in
+	// ui_desktop.go), and remove the running flag.
+	return u.running.Load() && !u.isTerminated()
+}
+
+func (u *UserInterface) setRunning(running bool) {
+	u.running.Store(running)
+}
+
+func (u *UserInterface) isTerminated() bool {
+	return u.terminated.Load()
+}
+
+func (u *UserInterface) setTerminated() {
+	u.terminated.Store(true)
+}
+
+func (u *UserInterface) Tick() int64 {
+	return u.tick.Load()
+}
+
+func (u *UserInterface) incrementTick() {
+	u.tick.Add(1)
+}
+
+// advanceInputTimeToNextTick stamps the input events recorded from now on with the next tick.
+//
+// This must be called right after a tick's input snapshot is taken. An event can be recorded in the
+// middle of a tick, as a main-thread operation like resizing the window pumps the event queue there,
+// and the next tick is the first one that can report its edge.
+func (u *UserInterface) advanceInputTimeToNextTick() {
+	u.inputTime.Store(int64(NewInputTimeFromTick(u.tick.Load() + 1)))
+}
+
+func (u *UserInterface) InputTime() InputTime {
+	t := InputTime(u.inputTime.Add(1))
+	if t.Subtick() == 0 {
+		panic("ui: too many input events in a tick")
+	}
+	return t
+}
+
+// inputTimeSubtickBits is the number of bits for a counter in a tick.
+// An input time consists of a tick and a counter in a tick.
+// This means that an input time will be invalid when 2^20 = 1048576 inputs are handled in a tick,
+// but this should unlikely happen.
+const inputTimeSubtickBits = 20
+
+type InputTime int64
+
+func NewInputTimeFromTick(tick int64) InputTime {
+	return InputTime(tick << inputTimeSubtickBits)
+}
+
+func (i InputTime) Tick() int64 {
+	return int64(i >> inputTimeSubtickBits)
+}
+
+func (i InputTime) Subtick() int64 {
+	return int64(i & ((1 << inputTimeSubtickBits) - 1))
+}

@@ -1,0 +1,27 @@
+1 ICON "dasher.ico"
+1 VERSIONINFO
+FILEVERSION 0,2,8,0
+PRODUCTVERSION 0,2,8,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "140904B0"
+    BEGIN
+      VALUE "CompanyName", "Brendan McNeill"
+      VALUE "FileDescription", "Dasher D200 terminal emulator"
+      VALUE "FileVersion", "0.2.8"
+      VALUE "InternalName", "Dasher200"
+      VALUE "LegalCopyright", "Copyright (C) 2026 Brendan McNeill"
+      VALUE "OriginalFilename", "Dasher200.exe"
+      VALUE "ProductName", "Dasher D200"
+      VALUE "ProductVersion", "0.2.8"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x1409, 1200
+  END
+END
+1 24 "app.manifest"

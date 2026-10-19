@@ -1,0 +1,129 @@
+// Copyright 2019 The Ebiten Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package metal
+
+// Suppress the warnings about availability guard with -Wno-unguarded-availability-new.
+// It is because old Xcode (8 or older?) does not accept @available syntax.
+
+// #cgo CFLAGS: -Wno-unguarded-availability-new -x objective-c
+// #cgo LDFLAGS: -framework UIKit -framework QuartzCore -framework Foundation -framework CoreGraphics
+//
+// #import <UIKit/UIKit.h>
+//
+// // Core Animation allows mutation off the main thread only for a layer that is not
+// // associated with a view. The CAMetalLayer joins a UIView's layer tree at addSublayer,
+// // so both the attachment and the frame updates run on the main queue.
+//
+// #cgo noescape addSublayer
+// #cgo nocallback addSublayer
+// static void addSublayer(void* view, void* sublayer) {
+//   // The layer was created and configured on this thread, and that state is still in
+//   // this thread's implicit transaction. Commit it first, or the layer joins the tree
+//   // unconfigured and renders nothing.
+//   [CATransaction flush];
+//   dispatch_sync(dispatch_get_main_queue(), ^{
+//     CALayer* layer = ((UIView*)view).layer;
+//     [layer addSublayer:(CALayer*)sublayer];
+//   });
+// }
+//
+// #cgo noescape setFrame
+// #cgo nocallback setFrame
+// static void setFrame(void* cametal, void* uiview) {
+//   dispatch_sync(dispatch_get_main_queue(), ^{
+//     CGSize size = ((UIView*)uiview).frame.size;
+//     ((CALayer*)cametal).frame = CGRectMake(0, 0, size.width, size.height);
+//   });
+// }
+import "C"
+
+import (
+	"unsafe"
+
+	"github.com/hajimehoshi/ebiten/v2/internal/graphicsdriver/metal/ca"
+	"github.com/hajimehoshi/ebiten/v2/internal/graphicsdriver/metal/mtl"
+)
+
+func (v *view) setWindow(window uintptr) {
+	panic("metal: setWindow is not available on iOS")
+}
+
+func (v *view) setUIView(uiview uintptr) {
+	v.uiview.Store(uiview)
+}
+
+func (v *view) update() {
+	uiview := v.uiview.Load()
+	v.once.Do(func() {
+		if v.ml.Layer() == nil {
+			panic("metal: CAMetalLayer is not initialized yet")
+		}
+		C.addSublayer(unsafe.Pointer(uiview), v.ml.Layer())
+	})
+	C.setFrame(v.ml.Layer(), unsafe.Pointer(uiview))
+}
+
+const (
+	storageMode         = mtl.StorageModeShared
+	resourceStorageMode = mtl.ResourceStorageModeShared
+)
+
+func (v *view) nextDrawable() ca.MetalDrawable {
+	d, err := v.ml.NextDrawable()
+	if err != nil {
+		// Drawable is nil. This can happen at the initial state. Let's wait and see.
+		return ca.MetalDrawable{}
+	}
+	return d
+}
+
+func (v *view) finishDrawableUsage() {
+	// Do nothing.
+}
+
+func (v *view) setDrawableSize(width, height int) {
+	v.ml.SetDrawableSize(width, height)
+}
+
+func (v *view) updatePresentationState() {
+	// There is no user-driven window resizing on iOS, and presentsWithTransaction is always false.
+}
+
+func (v *view) shouldPresentWithTransaction() bool {
+	// There is no user-driven window resizing on iOS.
+	return false
+}
+
+func (v *view) presentDrawableWithTransaction(cb mtl.CommandBuffer, d ca.MetalDrawable) {
+	panic("metal: presentDrawableWithTransaction is not available on iOS")
+}
+
+func (v *view) presentDrawable(cb mtl.CommandBuffer, d ca.MetalDrawable) {
+	cb.PresentDrawable(d)
+}
+
+func (v *view) updateMetalDisplayLink() {
+	// Do nothing.
+}
+
+func (v *view) initializeOS() error {
+	// Do nothing.
+	return nil
+}
+
+// release releases the resources created at initialize.
+func (v *view) release() {
+	// Do nothing.
+}

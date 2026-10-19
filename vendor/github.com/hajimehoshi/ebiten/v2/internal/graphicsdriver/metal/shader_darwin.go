@@ -1,0 +1,155 @@
+// Copyright 2020 The Ebiten Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package metal
+
+import (
+	"fmt"
+
+	"github.com/hajimehoshi/ebiten/v2/internal/graphicsdriver"
+	"github.com/hajimehoshi/ebiten/v2/internal/graphicsdriver/metal/mtl"
+	"github.com/hajimehoshi/ebiten/v2/internal/shaderir"
+	"github.com/hajimehoshi/ebiten/v2/internal/shaderir/msl"
+	"github.com/hajimehoshi/ebiten/v2/internal/shaderprecomp"
+)
+
+type shaderRpsKey struct {
+	blend  graphicsdriver.Blend
+	screen bool
+}
+
+type Shader struct {
+	id       graphicsdriver.ShaderID
+	graphics *Graphics
+
+	ir   *shaderir.Program
+	lib  mtl.Library
+	fs   mtl.Function
+	vs   mtl.Function
+	rpss map[shaderRpsKey]mtl.RenderPipelineState
+}
+
+func newShader(id graphicsdriver.ShaderID, graphics *Graphics, device mtl.Device, program *shaderir.Program) (*Shader, error) {
+	s := &Shader{
+		id:       id,
+		graphics: graphics,
+		ir:       program,
+		rpss:     map[shaderRpsKey]mtl.RenderPipelineState{},
+	}
+	if err := s.init(device); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Shader) ID() graphicsdriver.ShaderID {
+	return s.id
+}
+
+func (s *Shader) Dispose() {
+	for _, rps := range s.rpss {
+		rps.Release()
+	}
+	s.vs.Release()
+	s.fs.Release()
+	s.lib.Release()
+	s.graphics.removeShader(s)
+}
+
+func (s *Shader) init(device mtl.Device) (err error) {
+	var src string
+	var lib mtl.Library
+	if libBin, ok := shaderprecomp.MetalLibrary(s.ir.SourceID, metalLibraryPlatform()); ok {
+		lib, err = device.NewLibraryWithData(libBin)
+		if err != nil {
+			return err
+		}
+	} else {
+		src = msl.Compile(s.ir)
+		lib, err = device.NewLibraryWithSource(src, mtl.CompileOptions{})
+		if err != nil {
+			return fmt.Errorf("metal: device.MakeLibrary failed: %w, source: %s", err, src)
+		}
+	}
+	defer func() {
+		if err != nil {
+			lib.Release()
+		}
+	}()
+
+	vs, err := lib.NewFunctionWithName(msl.VertexName)
+	if err != nil {
+		if src != "" {
+			return fmt.Errorf("metal: lib.MakeFunction for vertex failed: %w, source: %s", err, src)
+		}
+		return fmt.Errorf("metal: lib.MakeFunction for vertex failed: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			vs.Release()
+		}
+	}()
+
+	fs, err := lib.NewFunctionWithName(msl.FragmentName)
+	if err != nil {
+		if src != "" {
+			return fmt.Errorf("metal: lib.MakeFunction for fragment failed: %w, source: %s", err, src)
+		}
+		return fmt.Errorf("metal: lib.MakeFunction for fragment failed: %w", err)
+	}
+
+	s.lib = lib
+	s.fs = fs
+	s.vs = vs
+	return nil
+}
+
+func (s *Shader) RenderPipelineState(view *view, blend graphicsdriver.Blend, screen bool) (mtl.RenderPipelineState, error) {
+	key := shaderRpsKey{
+		blend:  blend,
+		screen: screen,
+	}
+	if rps, ok := s.rpss[key]; ok {
+		return rps, nil
+	}
+
+	rpld := mtl.RenderPipelineDescriptor{
+		VertexFunction:   s.vs,
+		FragmentFunction: s.fs,
+	}
+
+	// TODO: For the precise pixel format, whether the render target is the screen or not must be considered.
+	pix := mtl.PixelFormatRGBA8UNorm
+	if screen {
+		pix = view.colorPixelFormat()
+	}
+	rpld.ColorAttachments[0].PixelFormat = pix
+	rpld.ColorAttachments[0].BlendingEnabled = true
+
+	rpld.ColorAttachments[0].DestinationAlphaBlendFactor = blendFactorToMetalBlendFactor(blend.BlendFactorDestinationAlpha)
+	rpld.ColorAttachments[0].DestinationRGBBlendFactor = blendFactorToMetalBlendFactor(blend.BlendFactorDestinationRGB)
+	rpld.ColorAttachments[0].SourceAlphaBlendFactor = blendFactorToMetalBlendFactor(blend.BlendFactorSourceAlpha)
+	rpld.ColorAttachments[0].SourceRGBBlendFactor = blendFactorToMetalBlendFactor(blend.BlendFactorSourceRGB)
+	rpld.ColorAttachments[0].AlphaBlendOperation = blendOperationToMetalBlendOperation(blend.BlendOperationAlpha)
+	rpld.ColorAttachments[0].RGBBlendOperation = blendOperationToMetalBlendOperation(blend.BlendOperationRGB)
+	rpld.ColorAttachments[0].WriteMask = mtl.ColorWriteMaskAll
+
+	rps, err := view.getMTLDevice().NewRenderPipelineStateWithDescriptor(rpld)
+	if err != nil {
+		return mtl.RenderPipelineState{}, fmt.Errorf("metal: device.NewRenderPipelineStateWithDescriptor failed: %w", err)
+	}
+
+	s.rpss[key] = rps
+	return rps, nil
+}

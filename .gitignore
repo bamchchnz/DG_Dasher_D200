@@ -1,0 +1,6 @@
+# Build output (see build.sh)
+/build/
+/dist/
+/dasher200
+*.exe
+.DS_Store

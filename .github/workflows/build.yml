@@ -1,0 +1,22 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install llvm (for the universal Mac app)
+        run: sudo apt-get update && sudo apt-get install -y llvm
+      - name: Test and build all platforms
+        run: sh build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dasher-d200-downloads
+          path: dist/
